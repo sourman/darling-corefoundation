@@ -42,6 +42,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <strings.h>
+#include <sys/mman.h>
 
 
 #if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI || DEPLOYMENT_TARGET_LINUX
@@ -76,6 +78,8 @@
 CF_EXPORT void _CFBundleFlushCachesForURL(CFURLRef url) { }
 CF_EXPORT void _CFBundleFlushCaches(void) { }
 
+__attribute__((used)) static const char cfbundle_resource_overlay_v4[] = "cfbundle_resource_overlay_v4";
+
 CF_PRIVATE void _CFBundleFlushQueryTableCache(CFBundleRef bundle) {
     __CFLock(&bundle->_queryLock);
     if (bundle->_queryTable) {
@@ -109,6 +113,107 @@ CF_PRIVATE Boolean _CFIsResourceAtPath(CFStringRef path, Boolean *isDir) {
     if (!CFStringGetFileSystemRepresentation(path, pathBuf, CFMaxPathSize)) return false;
     
     return _CFIsResourceCommon(pathBuf, isDir);
+}
+
+/* Overlayfs can stat a dentry that later open/mmap cannot use, and
+ * CFURLCreateWithFileSystemPath can yield a relative or percent-encoded
+ * URL whose [NSURL path] / CFURLGetFileSystemRepresentation is not the
+ * Darwin path Chromium FilePath opens. Build the URL from the exact
+ * absolute bytes that open()+mmap() just succeeded on. */
+static CFURLRef _CFBundleCreateURLIfResourceExists(CFStringRef path) {
+    char pathBuf[CFMaxPathSize];
+    if (!path || !CFStringGetFileSystemRepresentation(path, pathBuf, sizeof(pathBuf))) {
+        return NULL;
+    }
+    if (pathBuf[0] != '/') {
+        return NULL;
+    }
+    struct stat st;
+    if (stat(pathBuf, &st) != 0) {
+        return NULL;
+    }
+    if ((st.st_mode & 0444) == 0) {
+        return NULL;
+    }
+    Boolean isDir = ((st.st_mode & S_IFMT) == S_IFDIR) ? true : false;
+    unsigned char head[4] = {0, 0, 0, 0};
+    if (!isDir) {
+        int fd = open(pathBuf, O_RDONLY);
+        if (fd < 0) {
+            return NULL;
+        }
+        ssize_t nread = read(fd, head, sizeof(head));
+        size_t mapLen = (st.st_size > 0) ? (size_t)st.st_size : 1;
+        void *mapped = mmap(NULL, mapLen, PROT_READ, MAP_PRIVATE, fd, 0);
+        int mapErr = (mapped == MAP_FAILED) ? errno : 0;
+        if (mapped != MAP_FAILED) {
+            munmap(mapped, mapLen);
+        }
+        close(fd);
+        if (nread < 0 || mapped == MAP_FAILED) {
+            fprintf(stderr, "cfbundle_resource_overlay_v4 open/mmap fail path=%s open_read=%zd mmap_errno=%d size=%lld\n",
+                    pathBuf, nread, mapErr, (long long)st.st_size);
+            fflush(stderr);
+            return NULL;
+        }
+    }
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(kCFAllocatorSystemDefault,
+                                                           (const UInt8 *)pathBuf,
+                                                           (CFIndex)strlen(pathBuf),
+                                                           isDir);
+    if (!url) {
+        return NULL;
+    }
+    char round[CFMaxPathSize];
+    round[0] = 0;
+    Boolean roundOk = CFURLGetFileSystemRepresentation(url, true, (UInt8 *)round, sizeof(round));
+    if (!roundOk || strcmp(round, pathBuf) != 0) {
+        char urlBuf[CFMaxPathSize];
+        urlBuf[0] = 0;
+        CFStringRef urlStr = CFURLGetString(url);
+        if (urlStr) {
+            CFStringGetCString(urlStr, urlBuf, sizeof(urlBuf), kCFStringEncodingUTF8);
+        }
+        fprintf(stderr, "cfbundle_resource_overlay_v4 roundtrip fail src=%s round=%s url=%s\n",
+                pathBuf, round, urlBuf);
+        fflush(stderr);
+        CFRelease(url);
+        return NULL;
+    }
+    return url;
+}
+
+static void _CFBundleAppendLocalizationFallbacksForLookup(CFMutableArrayRef names, CFStringRef lproj, CFBundleRef bundle) {
+    if (lproj && CFStringGetLength(lproj) > 0) {
+        CFArrayRef fallbacks = _CFBundleCopyLanguageFallbackNames(lproj);
+        if (fallbacks) {
+            CFArrayAppendArray(names, fallbacks, CFRangeMake(0, CFArrayGetCount(fallbacks)));
+            CFRelease(fallbacks);
+        }
+    }
+    if (bundle) {
+        CFArrayRef search = _CFBundleCopyLanguageSearchListInBundle(bundle);
+        if (search) {
+            CFIndex n = CFArrayGetCount(search);
+            for (CFIndex i = 0; i < n; i++) {
+                CFStringRef one = (CFStringRef)CFArrayGetValueAtIndex(search, i);
+                if (one && CFStringGetLength(one) > 0) {
+                    CFRange range = CFRangeMake(0, CFArrayGetCount(names));
+                    if (!CFArrayContainsValue(names, range, one)) {
+                        CFArrayAppendValue(names, one);
+                    }
+                }
+            }
+            CFRelease(search);
+        }
+    }
+    if (CFArrayGetCount(names) == 0) {
+        CFArrayRef fallbacks = _CFBundleCopyLanguageFallbackNames(CFSTR("en-US"));
+        if (fallbacks) {
+            CFArrayAppendArray(names, fallbacks, CFRangeMake(0, CFArrayGetCount(fallbacks)));
+            CFRelease(fallbacks);
+        }
+    }
 }
 
 
@@ -205,7 +310,7 @@ CF_EXPORT CFArrayRef CFBundleCopyResourceURLsOfTypeInDirectory(CFURLRef bundleUR
 
 #pragma mark -
 
-#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_WINDOWS
+#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_WINDOWS || DEPLOYMENT_TARGET_LINUX
 // Note that subDirName is expected to be the string for a URL
 CF_INLINE Boolean _CFBundleURLHasSubDir(CFURLRef url, CFStringRef subDirName) {
     Boolean isDir = false, result = false;
@@ -255,7 +360,25 @@ CF_PRIVATE uint8_t _CFBundleGetBundleVersionForURL(CFURLRef url) {
     _CFIterateDirectory(directoryPath, ^Boolean (CFStringRef fileName, uint8_t fileType) {
         // We're looking for a few different names, and also some info on if it's a directory or not.
         // We don't stop looking once we find one of the names. Otherwise we could run into the situation where we have both "Contents" and "Resources" in a framework, and we see Contents first but Resources is more important.
-        if (fileType == DT_DIR || fileType == DT_LNK) {
+        Boolean looksLikeDir = (fileType == DT_DIR || fileType == DT_LNK);
+#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI || DEPLOYMENT_TARGET_LINUX || DEPLOYMENT_TARGET_FREEBSD
+        /* overlayfs often reports DT_UNKNOWN; treat those names as directories if stat says so. */
+        if (!looksLikeDir && fileType == DT_UNKNOWN) {
+            char subdirPath[CFMaxPathLength];
+            struct stat statBuf;
+            if (CFStringGetFileSystemRepresentation(directoryPath, subdirPath, sizeof(subdirPath))) {
+                strlcat(subdirPath, "/", sizeof(subdirPath));
+                char fileNameBuf[CFMaxPathLength];
+                if (CFStringGetFileSystemRepresentation(fileName, fileNameBuf, sizeof(fileNameBuf))) {
+                    strlcat(subdirPath, fileNameBuf, sizeof(subdirPath));
+                    if (stat(subdirPath, &statBuf) == 0) {
+                        looksLikeDir = S_ISDIR(statBuf.st_mode) || S_ISLNK(statBuf.st_mode);
+                    }
+                }
+            }
+        }
+#endif
+        if (looksLikeDir) {
             CFIndex fileNameLen = CFStringGetLength(fileName);
             if (fileNameLen == resourcesDirectoryLength && CFStringCompareWithOptions(fileName, _CFBundleResourcesDirectoryName, CFRangeMake(0, resourcesDirectoryLength), kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
                 foundResources = true;
@@ -287,7 +410,7 @@ CF_PRIVATE uint8_t _CFBundleGetBundleVersionForURL(CFURLRef url) {
         }
     }
     
-#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_WINDOWS
+#if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_WINDOWS || DEPLOYMENT_TARGET_LINUX
     // Do a more substantial check for the subdirectories that make up version 0/1/2 bundles. These are sometimes symlinks (like in Frameworks) and they would have been missed by our check above. Perhaps we can do a check for DT_LNK there as well, if it's sufficient instead of looking at the actual contents.
     if (localVersion == 3) {
         if (hasFrameworkSuffix) {
@@ -1239,6 +1362,194 @@ CF_EXPORT CFTypeRef _CFBundleCopyFindResources(CFBundleRef bundle, CFURLRef bund
             returnValue = _CFBundleCopyURLsOfKey(bundle, bundleURL, bundleURLLanguages, resDir, realSubdirectory, key, lproj, returnArray, localized, bundleVersion, predicate);
         }
         CFRelease(bundlePath);
+    }
+
+    /* Apple language fallback: forLocalization:@"en-US" / @"en_US" must
+     * find en.lproj the way macOS preferred-language matching does. */
+    if (!returnArray && key && CFStringGetLength(key) > 0 &&
+        !CFStringHasPrefix(key, _CFBundleTypeIndicator) &&
+        !CFStringHasPrefix(key, _CFBundleAllFiles) &&
+        (!returnValue || (CFGetTypeID(returnValue) == CFArrayGetTypeID() && CFArrayGetCount((CFArrayRef)returnValue) == 0))) {
+        CFMutableArrayRef locNames = CFArrayCreateMutable(kCFAllocatorSystemDefault, 0, &kCFTypeArrayCallBacks);
+        _CFBundleAppendLocalizationFallbacksForLookup(locNames, lproj, bundle);
+        CFIndex nLoc = CFArrayGetCount(locNames);
+        for (CFIndex i = 0; i < nLoc; i++) {
+            CFStringRef tryLoc = (CFStringRef)CFArrayGetValueAtIndex(locNames, i);
+            if (lproj && CFEqual(tryLoc, lproj)) continue;
+            if (returnValue) {
+                CFRelease(returnValue);
+                returnValue = NULL;
+            }
+            returnValue = _CFBundleCopyURLsOfKey(bundle, bundleURL, bundleURLLanguages, resDir, realSubdirectory, key, tryLoc, returnArray, localized, bundleVersion, predicate);
+            if (returnValue && !(CFGetTypeID(returnValue) == CFArrayGetTypeID() && CFArrayGetCount((CFArrayRef)returnValue) == 0)) {
+                break;
+            }
+        }
+        CFRelease(locNames);
+    }
+
+    /* If the readdir query table missed a named file that exists at the
+     * canonical macOS Resources location, return it. Overlayfs can hide
+     * dentries (d_ino==0 / DT_UNKNOWN / truncated getdents) while stat
+     * of the real bundle path still succeeds — Chromium's
+     * PathForFrameworkBundleResource("icudtl.dat") and
+     * pathForResource:@"locale" ofType:@"pak" forLocalization:@"en"
+     * depend on this. */
+    if (!returnArray && !returnValue && key && CFStringGetLength(key) > 0 &&
+        !CFStringHasPrefix(key, _CFBundleTypeIndicator) &&
+        !CFStringHasPrefix(key, _CFBundleAllFiles)) {
+        CFStringRef fallbackBundlePath = NULL;
+        if (bundle && bundle->_bundleBasePath) {
+            fallbackBundlePath = (CFStringRef)CFRetain(bundle->_bundleBasePath);
+        } else if (bundleURL) {
+            CFURLRef absoluteURL = CFURLCopyAbsoluteURL(bundleURL);
+            fallbackBundlePath = CFURLCopyFileSystemPath(absoluteURL, PLATFORM_PATH_STYLE);
+            CFRelease(absoluteURL);
+        }
+        if (fallbackBundlePath) {
+            CFStringRef tryDirs[3];
+            CFIndex nTry = 0;
+            if (bundleVersion == 2) {
+                tryDirs[nTry++] = CFSTR("Contents/Resources");
+                tryDirs[nTry++] = CFSTR("Resources");
+            } else {
+                tryDirs[nTry++] = CFSTR("Resources");
+                tryDirs[nTry++] = CFSTR("Contents/Resources");
+            }
+            tryDirs[nTry++] = CFSTR("");
+            CFMutableArrayRef locNames = CFArrayCreateMutable(kCFAllocatorSystemDefault, 0, &kCFTypeArrayCallBacks);
+            _CFBundleAppendLocalizationFallbacksForLookup(locNames, lproj, bundle);
+            for (CFIndex i = 0; i < nTry && !returnValue; i++) {
+                CFMutableStringRef cand = CFStringCreateMutableCopy(kCFAllocatorSystemDefault, 0, fallbackBundlePath);
+                if (CFStringGetLength(tryDirs[i]) > 0) {
+                    _CFAppendPathComponent2(cand, tryDirs[i]);
+                }
+                if (realSubdirectory && CFStringGetLength(realSubdirectory) > 0) {
+                    _CFAppendPathComponent2(cand, realSubdirectory);
+                }
+                _CFAppendPathComponent2(cand, key);
+                returnValue = _CFBundleCreateURLIfResourceExists(cand);
+                CFRelease(cand);
+
+                CFIndex nLoc = CFArrayGetCount(locNames);
+                for (CFIndex j = 0; j < nLoc && !returnValue; j++) {
+                    CFStringRef loc = (CFStringRef)CFArrayGetValueAtIndex(locNames, j);
+                    CFMutableStringRef lprojCand = CFStringCreateMutableCopy(kCFAllocatorSystemDefault, 0, fallbackBundlePath);
+                    if (CFStringGetLength(tryDirs[i]) > 0) {
+                        _CFAppendPathComponent2(lprojCand, tryDirs[i]);
+                    }
+                    _CFAppendPathComponent2(lprojCand, loc);
+                    _CFAppendPathExtension2(lprojCand, _CFBundleLprojExtension);
+                    if (realSubdirectory && CFStringGetLength(realSubdirectory) > 0) {
+                        _CFAppendPathComponent2(lprojCand, realSubdirectory);
+                    }
+                    _CFAppendPathComponent2(lprojCand, key);
+                    returnValue = _CFBundleCreateURLIfResourceExists(lprojCand);
+                    if (returnValue) {
+                        char locBuf[64];
+                        char keyBuf[256];
+                        char fsBuf[CFMaxPathSize];
+                        locBuf[0] = keyBuf[0] = fsBuf[0] = 0;
+                        CFStringGetCString(loc, locBuf, sizeof(locBuf), kCFStringEncodingUTF8);
+                        CFStringGetCString(key, keyBuf, sizeof(keyBuf), kCFStringEncodingUTF8);
+                        CFURLGetFileSystemRepresentation((CFURLRef)returnValue, true, (UInt8 *)fsBuf, sizeof(fsBuf));
+                        fprintf(stderr, "cfbundle_resource_overlay_v4 %s -> %s.lproj/%s path=%s\n",
+                                (lproj && CFStringGetLength(lproj) > 0) ? "forLocalization" : "default",
+                                locBuf, keyBuf, fsBuf);
+                        fflush(stderr);
+                    }
+                    CFRelease(lprojCand);
+                }
+            }
+            CFRelease(locNames);
+            CFRelease(fallbackBundlePath);
+        }
+    }
+
+    /* Same overlayfs miss for type listings (AppKit Backends/*.backend). */
+    if (returnArray && resourceType && CFStringGetLength(resourceType) > 0 &&
+        (!returnValue || (CFGetTypeID(returnValue) == CFArrayGetTypeID() && CFArrayGetCount((CFArrayRef)returnValue) == 0))) {
+        CFStringRef fallbackBundlePath = NULL;
+        if (bundle && bundle->_bundleBasePath) {
+            fallbackBundlePath = (CFStringRef)CFRetain(bundle->_bundleBasePath);
+        } else if (bundleURL) {
+            CFURLRef absoluteURL = CFURLCopyAbsoluteURL(bundleURL);
+            fallbackBundlePath = CFURLCopyFileSystemPath(absoluteURL, PLATFORM_PATH_STYLE);
+            CFRelease(absoluteURL);
+        }
+        if (fallbackBundlePath) {
+            char typeBuf[256];
+            if (CFStringGetFileSystemRepresentation(resourceType, typeBuf, sizeof(typeBuf))) {
+                size_t typeLen = strlen(typeBuf);
+                CFStringRef tryDirs[2];
+                tryDirs[0] = (bundleVersion == 2) ? CFSTR("Contents/Resources") : CFSTR("Resources");
+                tryDirs[1] = (bundleVersion == 2) ? CFSTR("Resources") : CFSTR("Contents/Resources");
+                CFMutableArrayRef found = CFArrayCreateMutable(kCFAllocatorSystemDefault, 0, &kCFTypeArrayCallBacks);
+                for (CFIndex i = 0; i < 2; i++) {
+                    CFMutableStringRef dirPath = CFStringCreateMutableCopy(kCFAllocatorSystemDefault, 0, fallbackBundlePath);
+                    _CFAppendPathComponent2(dirPath, tryDirs[i]);
+                    if (realSubdirectory && CFStringGetLength(realSubdirectory) > 0) {
+                        _CFAppendPathComponent2(dirPath, realSubdirectory);
+                    }
+                    char dirBuf[CFMaxPathSize];
+                    if (CFStringGetFileSystemRepresentation(dirPath, dirBuf, sizeof(dirBuf))) {
+                        DIR *dirp = opendir(dirBuf);
+                        if (dirp) {
+                            struct dirent *dent;
+                            while ((dent = readdir(dirp))) {
+                                size_t nlen = strlen(dent->d_name);
+                                if (nlen <= typeLen + 1) continue;
+                                if (dent->d_name[nlen - typeLen - 1] != '.') continue;
+                                if (strcasecmp(dent->d_name + nlen - typeLen, typeBuf) != 0) continue;
+                                CFMutableStringRef cand = CFStringCreateMutableCopy(kCFAllocatorSystemDefault, 0, dirPath);
+                                CFStringRef fn = CFStringCreateWithFileSystemRepresentation(kCFAllocatorSystemDefault, dent->d_name);
+                                if (fn) {
+                                    _CFAppendPathComponent2(cand, fn);
+                                    CFRelease(fn);
+                                }
+                                Boolean isDir = false;
+                                if (_CFIsResourceAtPath(cand, &isDir)) {
+                                    CFURLRef u = CFURLCreateWithFileSystemPath(kCFAllocatorSystemDefault, cand, PLATFORM_PATH_STYLE, isDir);
+                                    if (u) {
+                                        CFArrayAppendValue(found, u);
+                                        CFRelease(u);
+                                    }
+                                }
+                                CFRelease(cand);
+                            }
+                            closedir(dirp);
+                        }
+                    }
+                    /* If readdir of the overlay still missed the dentry, stat the
+                     * real Cocotron X11.<type> bundle (X11.backend). */
+                    if (CFArrayGetCount(found) == 0) {
+                        CFMutableStringRef cand = CFStringCreateMutableCopy(kCFAllocatorSystemDefault, 0, dirPath);
+                        CFMutableStringRef guess = CFStringCreateMutableCopy(kCFAllocatorSystemDefault, 0, CFSTR("X11."));
+                        CFStringAppend(guess, resourceType);
+                        _CFAppendPathComponent2(cand, guess);
+                        Boolean isDir = false;
+                        if (_CFIsResourceAtPath(cand, &isDir)) {
+                            CFURLRef u = CFURLCreateWithFileSystemPath(kCFAllocatorSystemDefault, cand, PLATFORM_PATH_STYLE, isDir);
+                            if (u) {
+                                CFArrayAppendValue(found, u);
+                                CFRelease(u);
+                            }
+                        }
+                        CFRelease(guess);
+                        CFRelease(cand);
+                    }
+                    CFRelease(dirPath);
+                    if (CFArrayGetCount(found) > 0) break;
+                }
+                if (CFArrayGetCount(found) > 0) {
+                    if (returnValue) CFRelease(returnValue);
+                    returnValue = found;
+                } else {
+                    CFRelease(found);
+                }
+            }
+            CFRelease(fallbackBundlePath);
+        }
     }
     
     if (realResourceName) CFRelease(realResourceName);

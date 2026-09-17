@@ -1088,9 +1088,16 @@ CF_PRIVATE void _CFIterateDirectory(CFStringRef directoryPath, Boolean (^fileHan
 #if DEPLOYMENT_TARGET_LINUX
             CFIndex nameLen = strlen(dent->d_name);
 #else
+            /* Overlayfs/FUSE can report d_namlen=0; fall back to the C string. */
             CFIndex nameLen = dent->d_namlen;
+            if (0 == nameLen) {
+                nameLen = (CFIndex)strlen(dent->d_name);
+            }
 #endif
-            if (0 == nameLen || 0 == dent->d_fileno || ('.' == dent->d_name[0] && (1 == nameLen || (2 == nameLen && '.' == dent->d_name[1]) || '_' == dent->d_name[1]))) {
+            /* Do not skip d_fileno==0: overlayfs and some FUSE mounts report inode 0
+             * for otherwise valid entries. Skipping them hides bundle Resources
+             * (e.g. icudtl.dat) from CFBundleCopyResourceURL. Still skip . .. and ._ */
+            if (0 == nameLen || ('.' == dent->d_name[0] && (1 == nameLen || (2 == nameLen && '.' == dent->d_name[1]) || '_' == dent->d_name[1]))) {
                 continue;
             }
             

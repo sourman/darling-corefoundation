@@ -65,7 +65,8 @@ static inline CFNotificationObserver *CFNotificationObserverRetain(CFAllocatorRe
 
 static inline void CFNotificationObserverRelease(CFAllocatorRef allocator,CFNotificationObserver *observer) {
     if (OSAtomicDecrement32(&observer->retainCount) < 0) {
-        CFRelease(observer->name);
+        if (observer->name)
+            CFRelease(observer->name);
         free(observer);
     }
 }
@@ -83,8 +84,11 @@ static inline Boolean CFNotificationObserverEqual(CFNotificationObserver *observ
         return false;
     }
 
-    if (CFStringCompare(observer1->name, observer2->name, 0) != kCFCompareEqualTo) {
-        return false;
+    if (observer1->name != observer2->name) {
+        if (observer1->name == NULL || observer2->name == NULL)
+            return false;
+        if (CFStringCompare(observer1->name, observer2->name, 0) != kCFCompareEqualTo)
+            return false;
     }
 
     if (observer1->object != observer2->object) {
@@ -140,12 +144,16 @@ CF_EXPORT CFNotificationCenterRef CFNotificationCenterGetDistributedCenter(void)
     return distributedCenter;
 }
 
+__attribute__((used)) static const char cf_notify_name_nil_v1[] = "cf_notify_name_nil_v1";
+
 CF_EXPORT void CFNotificationCenterAddObserver(CFNotificationCenterRef center, const void *observer, CFNotificationCallback callBack, CFStringRef name, const void *object, CFNotificationSuspensionBehavior suspensionBehavior) {
     CFNotificationObserver *obs = (CFNotificationObserver *)malloc(sizeof(CFNotificationObserver));
     obs->retainCount = 0;
     obs->observer = observer;
     obs->callBack = callBack;
-    obs->name = CFStringCreateCopy(kCFAllocatorDefault, name);
+    /* Apple: name==NULL means observe all (local center). CreateCopy(NULL) SEGV. */
+    obs->name = name ? CFStringCreateCopy(kCFAllocatorDefault, name) : NULL;
+    (void)cf_notify_name_nil_v1;
     obs->object = object;
     obs->suspensionBehavior = suspensionBehavior;
     OSSpinLockLock(&center->lock);
@@ -172,9 +180,9 @@ void removeObserver(CFNotificationObserver *observer, struct __CFNotificationRem
     if (observer->observer == ctx->observer) {
         Boolean nameMatches = false;
         Boolean objectMatches = false;
-        if (ctx->name != NULL && CFStringCompare(observer->name, ctx->name, 0) == kCFCompareEqualTo) {
+        if (ctx->name == NULL) {
             nameMatches = true;
-        } else if (ctx->name == NULL) {
+        } else if (observer->name != NULL && CFStringCompare(observer->name, ctx->name, 0) == kCFCompareEqualTo) {
             nameMatches = true;
         }
         if (ctx->object != NULL && ctx->object == observer->object) {

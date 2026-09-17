@@ -1035,6 +1035,51 @@ CFBundleRef _CFBundleGetExistingBundleWithBundleURL(CFURLRef bundleURL) {
     return bundle;
 }
 
+/* Chromium CHECK([NSBundle bundleWithURL:]) passes the helper executable
+ * (.../Foo.app/Contents/MacOS/Foo). CFBundleCreate must use the .app/.framework
+ * directory. Apple resolves this; Darling previously returned NULL (version 3 +
+ * S_IFREG) → ImmediateCrash. */
+__attribute__((used)) static const char cfbundle_create_exec_promote_v1[] = "cfbundle_create_exec_promote_v1";
+
+static Boolean _CFBundlePromoteExecutablePathToBundleDir(char *buff, size_t buffsz) {
+    struct stat st;
+    char path[CFMaxPathSize];
+    char info[CFMaxPathSize];
+    size_t origLen;
+
+    if (!buff || buff[0] != '/') return false;
+    origLen = strlen(buff);
+    if (origLen == 0 || origLen >= sizeof(path) || origLen >= buffsz) return false;
+    if (stat(buff, &st) != 0) return false;
+    if ((st.st_mode & S_IFMT) == S_IFDIR) return false;
+
+    memcpy(path, buff, origLen + 1);
+    for (int i = 0; i < 10; i++) {
+        char *slash = strrchr(path, '/');
+        if (!slash || slash == path) return false;
+        *slash = '\0';
+        int n = snprintf(info, sizeof(info), "%s/Contents/Info.plist", path);
+        if (n > 0 && (size_t)n < sizeof(info) && stat(info, &st) == 0) {
+            size_t plen = strlen(path);
+            if (plen >= buffsz) return false;
+            fprintf(stderr, "cfbundle_create_exec_promote_v1 %s -> %s\n", buff, path);
+            fflush(stderr);
+            memcpy(buff, path, plen + 1);
+            return true;
+        }
+        n = snprintf(info, sizeof(info), "%s/Resources/Info.plist", path);
+        if (n > 0 && (size_t)n < sizeof(info) && stat(info, &st) == 0) {
+            size_t plen = strlen(path);
+            if (plen >= buffsz) return false;
+            fprintf(stderr, "cfbundle_create_exec_promote_v1 %s -> %s\n", buff, path);
+            fflush(stderr);
+            memcpy(buff, path, plen + 1);
+            return true;
+        }
+    }
+    return false;
+}
+
 static CFBundleRef _CFBundleCreate(CFAllocatorRef allocator, CFURLRef bundleURL, Boolean alreadyLocked, Boolean doFinalProcessing, Boolean noCaches) {
     CFBundleRef bundle = NULL;
     char buff[CFMaxPathSize];
@@ -1044,7 +1089,18 @@ static CFBundleRef _CFBundleCreate(CFAllocatorRef allocator, CFURLRef bundleURL,
     CFURLRef newURL = NULL;
     uint8_t localVersion = 0;
     
-    if (!CFURLGetFileSystemRepresentation(bundleURL, true, (uint8_t *)buff, CFMaxPathSize)) return NULL;
+    if (!CFURLGetFileSystemRepresentation(bundleURL, true, (uint8_t *)buff, CFMaxPathSize)) {
+        CFStringRef pathStr = CFURLCopyFileSystemPath(bundleURL, PLATFORM_PATH_STYLE);
+        Boolean ok = pathStr && CFStringGetFileSystemRepresentation(pathStr, buff, CFMaxPathSize);
+        if (pathStr) CFRelease(pathStr);
+        if (!ok) {
+            fprintf(stderr, "cfbundle_create_exec_promote_v1 GFS fail\n");
+            fflush(stderr);
+            return NULL;
+        }
+    }
+
+    (void)_CFBundlePromoteExecutablePathToBundleDir(buff, sizeof(buff));
 
     newURL = CFURLCreateFromFileSystemRepresentation(allocator, (uint8_t *)buff, strlen(buff), true);
     if (!newURL) newURL = (CFURLRef)CFRetain(bundleURL);
@@ -1075,11 +1131,16 @@ static CFBundleRef _CFBundleCreate(CFAllocatorRef allocator, CFURLRef bundleURL,
 #endif
         if (res == 0) {
             if (!exists || ((mode & S_IFMT) != S_IFDIR)) {
+                fprintf(stderr, "cfbundle_create_exec_promote_v1 notdir exists=%d mode=0%o path=%s\n",
+                        (int)exists, (unsigned)mode, buff);
+                fflush(stderr);
                 if (modDate) CFRelease(modDate);
                 CFRelease(newURL);
                 return NULL;
             }
         } else {
+            fprintf(stderr, "cfbundle_create_exec_promote_v1 staterr res=%d path=%s\n", (int)res, buff);
+            fflush(stderr);
             CFRelease(newURL);
             return NULL;
         }

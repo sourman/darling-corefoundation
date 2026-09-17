@@ -32,6 +32,8 @@
 
 #include <unicode/ualoc.h>
 #include <ctype.h>
+#include <string.h>
+#include <stdio.h>
 
 static CFStringRef _CFBundleCopyLanguageFoundInLocalizations(CFArrayRef localizations, CFStringRef language);
 
@@ -237,6 +239,123 @@ static CFStringRef _CFBundleCopyModifiedLocalization(CFStringRef localizationNam
     return result;
 }
 
+static void _CFBundleAppendUniqueLocalization(CFMutableArrayRef array, CFStringRef loc) {
+    if (!array || !loc || CFStringGetLength(loc) == 0) return;
+    CFRange range = CFRangeMake(0, CFArrayGetCount(array));
+    if (!CFArrayContainsValue(array, range, loc)) {
+        CFArrayAppendValue(array, loc);
+    }
+}
+
+/* Names to try for a requested localization, in Apple preference order.
+ * Does not require the .lproj to exist — callers stat or match against
+ * whatever localizations the bundle actually has. Chromium asks for
+ * locale.pak with forLocalization:@"en-US" / @"en_US" while shipping
+ * only en.lproj (crbug.com/25578). */
+CF_PRIVATE CFArrayRef _CFBundleCopyLanguageFallbackNames(CFStringRef language) {
+    CFMutableArrayRef result = CFArrayCreateMutable(kCFAllocatorSystemDefault, 0, &kCFTypeArrayCallBacks);
+    if (language && CFStringGetLength(language) > 0) {
+        _CFBundleAppendUniqueLocalization(result, language);
+
+        CFStringRef modified = _CFBundleCopyModifiedLocalization(language);
+        if (modified) {
+            _CFBundleAppendUniqueLocalization(result, modified);
+            CFRelease(modified);
+        }
+
+        char locale[128];
+        if (CFStringGetCString(language, locale, 128, kCFStringEncodingUTF8)) {
+            UErrorCode error = U_ZERO_ERROR;
+            char parent[128];
+            int counter = 0;
+            while (1) {
+                ualoc_getAppleParent(locale, parent, 128, &error);
+                if (error != U_ZERO_ERROR) break;
+                if (strncmp(parent, "root", 4) == 0) break;
+
+                CFStringRef parentString = CFStringCreateWithCString(kCFAllocatorSystemDefault, parent, kCFStringEncodingUTF8);
+                if (parentString) {
+                    _CFBundleAppendUniqueLocalization(result, parentString);
+                    CFStringRef parentModified = _CFBundleCopyModifiedLocalization(parentString);
+                    if (parentModified) {
+                        _CFBundleAppendUniqueLocalization(result, parentModified);
+                        CFRelease(parentModified);
+                    }
+                    CFRelease(parentString);
+                }
+
+                if (strlcpy(locale, parent, 128) >= 128) break;
+                counter++;
+                if (counter >= 16) break;
+                error = U_ZERO_ERROR;
+            }
+        }
+
+        CFIndex length = CFStringGetLength(language);
+        if (length >= 4) {
+            UniChar sep = CFStringGetCharacterAtIndex(language, 2);
+            if ('-' == sep || '_' == sep) {
+                CFStringRef langOnly = CFStringCreateWithSubstring(kCFAllocatorSystemDefault, language, CFRangeMake(0, 2));
+                if (langOnly) {
+                    _CFBundleAppendUniqueLocalization(result, langOnly);
+                    CFRelease(langOnly);
+                }
+            }
+        }
+    }
+
+    _CFBundleAppendUniqueLocalization(result, CFSTR("en"));
+    _CFBundleAppendUniqueLocalization(result, CFSTR("English"));
+    _CFBundleAppendUniqueLocalization(result, _CFBundleBaseDirectory);
+    return result;
+}
+
+static void _CFBundleAddLProjIfDirectoryExists(CFMutableArrayRef result, CFStringRef directoryPath, CFStringRef locName) {
+    if (!result || !directoryPath || !locName || CFStringGetLength(locName) == 0) return;
+    CFRange range = CFRangeMake(0, CFArrayGetCount(result));
+    if (CFArrayContainsValue(result, range, locName)) return;
+
+    CFMutableStringRef cand = CFStringCreateMutableCopy(kCFAllocatorSystemDefault, 0, directoryPath);
+    _CFAppendPathComponent2(cand, locName);
+    _CFAppendPathExtension2(cand, _CFBundleLprojExtension);
+    Boolean isDir = false;
+    if (_CFIsResourceAtPath(cand, &isDir) && isDir) {
+        CFArrayAppendValue(result, locName);
+    }
+    CFRelease(cand);
+}
+
+static void _CFBundleOverlayProbeHiddenLProjs(CFMutableArrayRef result, CFStringRef directoryPath) {
+    /* Overlayfs can omit .lproj dentries from readdir (d_ino==0 / truncated
+     * getdents) while stat of the real directory still succeeds. Probe the
+     * Apple language fallback chain so en.lproj is visible for en-US. */
+    CFArrayRef userLanguages = _CFBundleCopyUserLanguages();
+    CFMutableArrayRef probes = CFArrayCreateMutable(kCFAllocatorSystemDefault, 0, &kCFTypeArrayCallBacks);
+    if (userLanguages) {
+        CFIndex count = CFArrayGetCount(userLanguages);
+        for (CFIndex i = 0; i < count; i++) {
+            CFStringRef lang = (CFStringRef)CFArrayGetValueAtIndex(userLanguages, i);
+            CFArrayRef fallbacks = _CFBundleCopyLanguageFallbackNames(lang);
+            if (fallbacks) {
+                CFArrayAppendArray(probes, fallbacks, CFRangeMake(0, CFArrayGetCount(fallbacks)));
+                CFRelease(fallbacks);
+            }
+        }
+        CFRelease(userLanguages);
+    }
+    CFArrayRef englishFallbacks = _CFBundleCopyLanguageFallbackNames(CFSTR("en-US"));
+    if (englishFallbacks) {
+        CFArrayAppendArray(probes, englishFallbacks, CFRangeMake(0, CFArrayGetCount(englishFallbacks)));
+        CFRelease(englishFallbacks);
+    }
+
+    CFIndex n = CFArrayGetCount(probes);
+    for (CFIndex i = 0; i < n; i++) {
+        _CFBundleAddLProjIfDirectoryExists(result, directoryPath, (CFStringRef)CFArrayGetValueAtIndex(probes, i));
+    }
+    CFRelease(probes);
+}
+
 static SInt32 _CFBundleGetLanguageCodeForRegionCode(SInt32 regionCode) {
     SInt32 result = -1, i;
     if (52 == regionCode) {     // hack for mixed-up Chinese language codes
@@ -401,6 +520,13 @@ static CFArrayRef _CFBundleCopyLProjDirectoriesForURL(CFAllocatorRef allocator, 
         }
         return true;
     });
+
+    if (!result) result = CFArrayCreateMutable(allocator, 0, &kCFTypeArrayCallBacks);
+    _CFBundleOverlayProbeHiddenLProjs(result, directoryPath);
+    if (CFArrayGetCount(result) == 0) {
+        CFRelease(result);
+        result = NULL;
+    }
     
     CFRelease(directoryPath);
     return (CFArrayRef)result;

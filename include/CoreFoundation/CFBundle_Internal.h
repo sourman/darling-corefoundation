@@ -167,6 +167,8 @@ CF_PRIVATE CFStringRef _CFBundleCopyLoadedImagePathForPointer(void *p);
 
 CF_PRIVATE CFArrayRef _CFBundleCopyLanguageSearchListInDirectory(CFURLRef url, uint8_t *version);
 CF_PRIVATE CFArrayRef _CFBundleCopyLanguageSearchListInBundle(CFBundleRef bundle);
+/* Apple-style language parents: en-US / en_US → en, plus hyphen/underscore twins. */
+CF_PRIVATE CFArrayRef _CFBundleCopyLanguageFallbackNames(CFStringRef language);
 
 CF_PRIVATE Boolean CFBundleAllowMixedLocalizations(void);
 

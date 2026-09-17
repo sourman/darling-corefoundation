@@ -164,6 +164,7 @@ set(cf_sources
 	NSRunLoopModes.m
 	NSFileSecurity.m
 	NSBlockInvocation.m
+	extra_comet_stubs.c
 )
 
 set(FRAMEWORK_VERSION "A")
