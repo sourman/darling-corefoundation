@@ -39,6 +39,9 @@
 #include <dirent.h>
 #include <sys/sysctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <string.h>
 #endif
 
 // The following strings are initialized 'later' (i.e., not at static initialization time) because static init time is too early for CFSTR to work, on platforms without constant CF strings
@@ -560,6 +563,45 @@ CF_PRIVATE CFDictionaryRef _CFBundleCopyInfoDictionaryInDirectoryWithVersion(CFA
         
         if (platformInfoPlistURL) CFRelease(platformInfoPlistURL);
         if (infoPlistURL) CFRelease(infoPlistURL);
+    }
+
+    /* Darling: _CFIterateDirectory / bundle-version detection can miss
+     * Contents/Info.plist (nested Helper.app). Chromium then sees a nil
+     * LSUIElement and ImmediateCrashes: Main application forbids --type. */
+    if (!result || !CFDictionaryGetValue(result, kCFBundleIdentifierKey)) {
+        char buff[CFMaxPathSize];
+        char info[CFMaxPathSize];
+        struct stat st;
+        if (CFURLGetFileSystemRepresentation(url, true, (uint8_t *)buff, sizeof(buff))) {
+            int n = snprintf(info, sizeof(info), "%s/Contents/Info.plist", buff);
+            if (n > 0 && (size_t)n < sizeof(info) && stat(info, &st) == 0 && ((st.st_mode & S_IFMT) == S_IFREG)) {
+                CFURLRef plistURL = CFURLCreateFromFileSystemRepresentation(alloc, (const UInt8 *)info, (CFIndex)strlen(info), false);
+                CFDataRef infoData = NULL;
+                if (plistURL) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated"
+                    CFURLCreateDataAndPropertiesFromResource(kCFAllocatorSystemDefault, plistURL, &infoData, NULL, NULL, NULL);
+#pragma GCC diagnostic pop
+                    if (infoData) {
+                        CFErrorRef error = NULL;
+                        CFPropertyListRef parsed = CFPropertyListCreateWithData(alloc, infoData, kCFPropertyListMutableContainers, NULL, &error);
+                        if (error) CFRelease(error);
+                        if (parsed && CFGetTypeID(parsed) == CFDictionaryGetTypeID() &&
+                            CFDictionaryGetValue((CFDictionaryRef)parsed, kCFBundleIdentifierKey)) {
+                            if (result) CFRelease(result);
+                            result = (CFDictionaryRef)parsed;
+                            fprintf(stderr, "cfbundle_contents_infoplist_v1 %s count=%ld\n",
+                                    info, (long)CFDictionaryGetCount(result));
+                            fflush(stderr);
+                        } else {
+                            if (parsed) CFRelease(parsed);
+                        }
+                        CFRelease(infoData);
+                    }
+                    CFRelease(plistURL);
+                }
+            }
+        }
     }
     
     if (!result) {

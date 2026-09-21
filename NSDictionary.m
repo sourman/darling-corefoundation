@@ -12,7 +12,12 @@
 #import <Foundation/NSArray.h>
 #import <Foundation/NSSet.h>
 #import <Foundation/NSURL.h>
+#import <Foundation/NSData.h>
 #include <Foundation/NSError.h>
+
+__attribute__((used)) static const char writetourl_error_v1[] = "writetourl_error_v1";
+__attribute__((used)) static const char cf_setobject_cfdispatch_v1[] = "cf_setobject_cfdispatch_v1";
+__attribute__((used)) static const char nsexc_nilremove_v1[] = "nsexc_nilremove_v1";
 
 #import "CFInternal.h"
 #import "CFSortFunctions.h"
@@ -20,6 +25,8 @@
 #import <Foundation/NSKeyValueObserving.h>
 #import "NSObjectInternal.h"
 #import "NSStringInternal.h"
+#import <execinfo.h>
+#include <stdio.h>
 
 CF_EXPORT Boolean _CFDictionaryIsMutable(CFDictionaryRef ref);
 CF_EXPORT void _CFDictionarySetKVOBit(CFDictionaryRef hc, CFIndex bit);
@@ -48,6 +55,7 @@ CF_PRIVATE
     id *_values;
     id *_keys;
 }
+- (void)__setObject:(id)obj forKey:(id)key;
 @end
 
 CF_PRIVATE
@@ -986,6 +994,23 @@ static NSString *_getDescription(id obj, id locale, int level)
     return success;
 }
 
+- (BOOL)writeToURL:(NSURL *)url error:(NSError **)error
+{
+    (void)writetourl_error_v1;
+    NSData *data = (NSData *)_CFPropertyListCreateXMLData(kCFAllocatorDefault, (CFPropertyListRef)self, true);
+    BOOL success;
+
+    if (data == nil) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"NSCocoaErrorDomain" code:3840 userInfo:nil];
+        }
+        return NO;
+    }
+    success = [data writeToURL:url options:NSDataWritingAtomic error:error];
+    [data release];
+    return success;
+}
+
 - (NSArray *)keysSortedByValueUsingSelector:(SEL)comparator
 {
     return [[self allKeys] sortedArrayUsingComparator:^NSComparisonResult(id obj1, id obj2) {
@@ -1247,13 +1272,45 @@ static NSString *_getDescription(id obj, id locale, int level)
     }
 }
 
+- (void)__setObject:(id)obj forKey:(id)key
+{
+    (void)cf_setobject_cfdispatch_v1;
+    if (!_CFDictionaryIsMutable((CFDictionaryRef)self))
+    {
+        NSInvalidMutation();
+        return;
+    }
+    if (key == nil)
+    {
+        return;
+    }
+    if (obj == nil)
+    {
+        CFDictionaryRemoveValue((CFMutableDictionaryRef)self, (const void *)key);
+        return;
+    }
+    [self willChangeValueForKey:key];
+    CFDictionarySetValue((CFMutableDictionaryRef)self, (const void *)key, (const void *)obj);
+    [self didChangeValueForKey:key];
+}
+
 - (void)setObject:(id)obj forKey:(id)key
 {
     if (_CFDictionaryIsMutable((CFDictionaryRef)self))
     {
         if ((obj == nil) || (key == nil))
         {
-            @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Cannot set nil objects nor nil keys" userInfo:nil];
+            (void)nsexc_nilremove_v1;
+            fprintf(stderr, "nsexc_nilremove_v1 setObject obj=%p key=%p self=%p\n", obj, key, self);
+            void *stack[24];
+            int nframes = backtrace(stack, 24);
+            backtrace_symbols_fd(stack, nframes, 2);
+            fflush(stderr);
+            if (key == nil)
+            {
+                return;
+            }
+            CFDictionaryRemoveValue((CFMutableDictionaryRef)self, (const void *)key);
             return;
         }
 

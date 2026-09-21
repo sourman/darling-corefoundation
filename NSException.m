@@ -14,6 +14,7 @@
 #import <dispatch/dispatch.h>
 #import <objc/runtime.h>
 #import <execinfo.h>
+#include <stdio.h>
 
 @interface NSException ()
 - (BOOL)_installStackTraceKeyIfNeeded;
@@ -91,6 +92,14 @@ NSString *const NSFileHandleOperationException = @"NSFileHandleOperationExceptio
 }
 
 - (void) raise {
+    const char *n = [(NSString *)_name UTF8String];
+    const char *r = [(NSString *)_reason UTF8String];
+    fprintf(stderr, "nsexc_v1 raise name=%s reason=%s obj=%p class=%s\n",
+            n ? n : "(nil)", r ? r : "(nil)", self, object_getClassName(self));
+    void *stack[24];
+    int nframes = backtrace(stack, 24);
+    backtrace_symbols_fd(stack, nframes, 2);
+    fflush(stderr);
     @throw self;
 }
 
@@ -101,6 +110,10 @@ NSString *const NSFileHandleOperationException = @"NSFileHandleOperationExceptio
     va_start(args, format);
     CFStringRef reason = CFStringCreateWithFormatAndArguments(kCFAllocatorDefault, NULL, (CFStringRef) format, args);
     va_end(args);
+    fprintf(stderr, "nsexc_v1 raise:format: name=%s reason=%s\n",
+            name ? [(NSString *)name UTF8String] : "(nil)",
+            reason ? [(NSString *)reason UTF8String] : "(nil)");
+    fflush(stderr);
     NSException *exc = [self exceptionWithName: name
                                         reason: (NSString*)reason
                                       userInfo: nil];
@@ -168,27 +181,50 @@ NSString *const NSFileHandleOperationException = @"NSFileHandleOperationExceptio
             return NO;
         }
 
-        // Make sure to skip this frame since it is just an instantiator.
+        // Skip this frame. Drop NULL symbols so we never setObject:nil
+        // (that used to turn any exception into "Cannot set nil objects").
+        int filled = 0;
         for (int i = 1; i < count; i++) {
-            returnAddresses[i - 1] = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &stack[i]);
-            symbols[i - 1] = CFStringCreateWithCString(kCFAllocatorDefault, sym[i], kCFStringEncodingUTF8);
+            if (sym[i] == NULL) {
+                continue;
+            }
+            CFStringRef s = CFStringCreateWithCString(kCFAllocatorDefault, sym[i], kCFStringEncodingUTF8);
+            if (s == NULL) {
+                s = CFStringCreateWithCString(kCFAllocatorDefault, sym[i], kCFStringEncodingISOLatin1);
+            }
+            if (s == NULL) {
+                continue;
+            }
+            returnAddresses[filled] = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &stack[i]);
+            symbols[filled] = s;
+            filled++;
         }
 
         free(sym);
-        callStackSymbols = [[NSArray alloc] initWithObjects: (id *) symbols
-                                                      count: count - 1];
-        NSArray *callStackReturnAddresses = [[NSArray alloc] initWithObjects: (id *) returnAddresses
-                                                                       count: count - 1];
-        _reserved[@"callStackSymbols"] = callStackSymbols;
-        _reserved[@"callStackReturnAddresses"] = callStackReturnAddresses;
+        if (filled > 0) {
+            callStackSymbols = [[NSArray alloc] initWithObjects: (id *) symbols
+                                                          count: filled];
+            NSArray *callStackReturnAddresses = [[NSArray alloc] initWithObjects: (id *) returnAddresses
+                                                                           count: filled];
+            if (callStackSymbols != nil) {
+                _reserved[@"callStackSymbols"] = callStackSymbols;
+            }
+            if (callStackReturnAddresses != nil) {
+                _reserved[@"callStackReturnAddresses"] = callStackReturnAddresses;
+            }
+            [callStackReturnAddresses release];
+        }
 
-        for (int i = 1; i < count; i++) {
-            CFRelease(returnAddresses[i - 1]);
-            CFRelease(symbols[i - 1]);
+        for (int i = 0; i < filled; i++) {
+            if (returnAddresses[i]) {
+                CFRelease(returnAddresses[i]);
+            }
+            if (symbols[i]) {
+                CFRelease(symbols[i]);
+            }
         }
 
         [callStackSymbols release];
-        [callStackReturnAddresses release];
     }
 
     return callStackSymbols != nil;

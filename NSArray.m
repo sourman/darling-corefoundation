@@ -9,7 +9,10 @@
 
 #import <Foundation/NSData.h>
 #import <Foundation/NSURL.h>
+#import <Foundation/NSError.h>
 #import <Foundation/NSIndexSet.h>
+
+__attribute__((used)) static const char writetourl_error_v1[] = "writetourl_error_v1";
 
 #import <objc/message.h>
 #import <objc/runtime.h>
@@ -1228,6 +1231,23 @@ SINGLETON_RR()
 {
     NSData *data = (NSData *)_CFPropertyListCreateXMLData(kCFAllocatorDefault, (CFPropertyListRef)self, true);
     BOOL success = [data writeToURL:url atomically:atomically];
+    [data release];
+    return success;
+}
+
+- (BOOL)writeToURL:(NSURL *)url error:(NSError **)error
+{
+    (void)writetourl_error_v1;
+    NSData *data = (NSData *)_CFPropertyListCreateXMLData(kCFAllocatorDefault, (CFPropertyListRef)self, true);
+    BOOL success;
+
+    if (data == nil) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"NSCocoaErrorDomain" code:3840 userInfo:nil];
+        }
+        return NO;
+    }
+    success = [data writeToURL:url options:NSDataWritingAtomic error:error];
     [data release];
     return success;
 }

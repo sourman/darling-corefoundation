@@ -141,7 +141,38 @@ const char *_CFProcessPath(void) {
 #endif
 
 #if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI
+/* Chromium helpers inherit CFProcessPath from the outer .app. That makes
+ * CFBundleGetMainBundle / [NSBundle mainBundle] the browser bundle, so
+ * LSUIElement is missing and ChromeMainDelegate ImmediateCrashes:
+ * "Main application forbids --type". Prefer argv[0] when it names a nested
+ * Helper.app. */
+__attribute__((used)) static const char cfprocess_helper_argv_v1[] = "cfprocess_helper_argv_v1";
+
+static const char *_CFNestedHelperArgv0(void) {
+    char **argv;
+    const char *arg0;
+    const char *helpers;
+    argv = *_NSGetArgv();
+    if (!argv || !argv[0] || argv[0][0] != '/') return NULL;
+    arg0 = argv[0];
+    helpers = strstr(arg0, "/Helpers/");
+    if (!helpers) return NULL;
+    if (!strstr(helpers, ".app/Contents/MacOS/")) return NULL;
+    return arg0;
+}
+
+static void _CFSetProcessPath(const char *path) {
+    __CFProcessPath = path;
+    if (path && path[0]) {
+        __CFprogname = strrchr(path, PATH_SEP);
+        __CFprogname = (__CFprogname ? __CFprogname + 1 : path);
+    } else {
+        __CFprogname = path;
+    }
+}
+
 const char *_CFProcessPath(void) {
+    const char *helper_arg0;
     if (__CFProcessPath) return __CFProcessPath;
 #if DEPLOYMENT_TARGET_MACOSX
     if (!issetugid()) {
@@ -150,16 +181,25 @@ const char *_CFProcessPath(void) {
 	    __CFProcessPath = strdup(path);
 	    __CFprogname = strrchr(__CFProcessPath, PATH_SEP);
 	    __CFprogname = (__CFprogname ? __CFprogname + 1 : __CFProcessPath);
-	    return __CFProcessPath;
 	}
     }
 #endif
-    uint32_t size = CFMaxPathSize;
-    char buffer[size];
-    if (0 == _NSGetExecutablePath(buffer, &size)) {
-	__CFProcessPath = strdup(buffer);
-	__CFprogname = strrchr(__CFProcessPath, PATH_SEP);
-	__CFprogname = (__CFprogname ? __CFprogname + 1 : __CFProcessPath);
+    if (!__CFProcessPath) {
+        uint32_t size = CFMaxPathSize;
+        char buffer[size];
+        if (0 == _NSGetExecutablePath(buffer, &size)) {
+            __CFProcessPath = strdup(buffer);
+            __CFprogname = strrchr(__CFProcessPath, PATH_SEP);
+            __CFprogname = (__CFprogname ? __CFprogname + 1 : __CFProcessPath);
+        }
+    }
+    helper_arg0 = _CFNestedHelperArgv0();
+    if (helper_arg0 && (!__CFProcessPath || __CFProcessPath[0] == '\0' ||
+                        strcmp(__CFProcessPath, helper_arg0) != 0)) {
+        fprintf(stderr, "cfprocess_helper_argv_v1 %s -> %s\n",
+                __CFProcessPath ? __CFProcessPath : "", helper_arg0);
+        fflush(stderr);
+        _CFSetProcessPath(strdup(helper_arg0));
     }
     if (!__CFProcessPath) {
 	__CFProcessPath = "";

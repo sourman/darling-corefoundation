@@ -736,7 +736,8 @@ static void _CFBundleInitializeMainBundleInfoDictionaryAlreadyLocked(CFStringRef
             if (executableName) CFRelease(executableName);
         }
 #if defined(BINARY_SUPPORT_DYLD)
-        if (_mainBundle->_binaryType == __CFBundleDYLDExecutableBinary) {
+        if (_mainBundle->_binaryType == __CFBundleDYLDExecutableBinary &&
+            !(_mainBundle->_infoDict && CFDictionaryGetValue(_mainBundle->_infoDict, kCFBundleIdentifierKey))) {
             if (_mainBundle->_infoDict && !(0)) CFRelease(_mainBundle->_infoDict);
             _mainBundle->_infoDict = (CFDictionaryRef)_CFBundleCreateInfoDictFromMainExecutable();
         }
@@ -745,8 +746,10 @@ static void _CFBundleInitializeMainBundleInfoDictionaryAlreadyLocked(CFStringRef
 #if defined(BINARY_SUPPORT_DYLD)
         if (_mainBundle->_binaryType == __CFBundleDYLDExecutableBinary) {
             // if dyld and not main executable for bundle, prefer info dictionary from executable
+            Boolean keepDiskPlist = _mainBundle->_infoDict &&
+                CFDictionaryGetValue(_mainBundle->_infoDict, kCFBundleIdentifierKey);
             CFStringRef executableName = _CFBundleCopyExecutableName(_mainBundle, NULL, NULL);
-            if (!executableName || !executablePath || !CFStringHasSuffix(executablePath, executableName)) {
+            if (!keepDiskPlist && (!executableName || !executablePath || !CFStringHasSuffix(executablePath, executableName))) {
                 CFDictionaryRef infoDictFromExecutable = (CFDictionaryRef)_CFBundleCreateInfoDictFromMainExecutable();
                 if (infoDictFromExecutable && CFDictionaryGetCount(infoDictFromExecutable) > 0) {
                     if (_mainBundle->_infoDict) CFRelease(_mainBundle->_infoDict);
@@ -863,6 +866,32 @@ static CFBundleRef _CFBundleGetMainBundleAlreadyLocked(void) {
                 }
 #endif /* BINARY_SUPPORT_DLFCN */
                 _CFBundleInitializeMainBundleInfoDictionaryAlreadyLocked(str);
+                {
+                    char urlbuf[CFMaxPathSize];
+                    char idbuf[160];
+                    CFDictionaryRef info;
+                    CFTypeRef lsui;
+                    CFTypeRef lsbg;
+                    CFStringRef bid;
+                    long lsui_num = -1;
+                    urlbuf[0] = 0;
+                    idbuf[0] = 0;
+                    if (_mainBundle->_url)
+                        CFURLGetFileSystemRepresentation(_mainBundle->_url, true, (uint8_t *)urlbuf, sizeof(urlbuf));
+                    info = CFBundleGetInfoDictionary(_mainBundle);
+                    lsui = info ? CFDictionaryGetValue(info, CFSTR("LSUIElement")) : NULL;
+                    lsbg = info ? CFDictionaryGetValue(info, CFSTR("LSBackgroundOnly")) : NULL;
+                    bid = info ? (CFStringRef)CFDictionaryGetValue(info, kCFBundleIdentifierKey) : NULL;
+                    if (bid) CFStringGetCString(bid, idbuf, sizeof(idbuf), kCFStringEncodingUTF8);
+                    if (lsui && CFGetTypeID(lsui) == CFNumberGetTypeID())
+                        CFNumberGetValue((CFNumberRef)lsui, kCFNumberLongType, &lsui_num);
+                    else if (lsui && CFGetTypeID(lsui) == CFBooleanGetTypeID())
+                        lsui_num = CFBooleanGetValue((CFBooleanRef)lsui) ? 1 : 0;
+                    fprintf(stderr, "cfbundle_main_helper_argv_v1 process=%s url=%s id=%s LSUIElement=%p n=%ld LSBackgroundOnly=%p dictn=%ld\n",
+                            processPath ? processPath : "", urlbuf, idbuf, lsui, lsui_num, lsbg,
+                            info ? (long)CFDictionaryGetCount(info) : -1L);
+                    fflush(stderr);
+                }
                 // Perform delayed final processing steps.
                 // This must be done after _isLoaded has been set, for security reasons (3624341).
                 if (_CFBundleNeedsInitPlugIn(_mainBundle)) {
@@ -1080,6 +1109,67 @@ static Boolean _CFBundlePromoteExecutablePathToBundleDir(char *buff, size_t buff
     return false;
 }
 
+/* Chromium helpers look up
+ *   Helper.app/Contents/Frameworks/Product.framework[/Versions/V]
+ * which on macOS is a symlink to the enclosing Product.framework. If the
+ * nested copy is missing, rewrite to the outer framework so CFBundleCreate
+ * does not return NULL (CHECK / ImmediateCrash). */
+__attribute__((used)) static const char cfbundle_helper_fw_resolve_v1[] = "cfbundle_helper_fw_resolve_v1";
+
+static Boolean _CFBundleResolveNestedHelperFramework(char *buff, size_t buffsz) {
+    struct stat st;
+    const char *helpers;
+    const char *nested;
+    const char *nested_name;
+    const char *outer_dot = NULL;
+    const char *outer_fw_end;
+    const char *outer_base;
+    const char *p;
+    const char *nested_after;
+    char rewritten[CFMaxPathSize];
+    size_t name_len;
+    int n;
+
+    if (!buff || buff[0] != '/') return false;
+    if (stat(buff, &st) == 0 && ((st.st_mode & S_IFMT) == S_IFDIR)) return false;
+
+    helpers = strstr(buff, "/Helpers/");
+    if (!helpers) return false;
+    nested = strstr(helpers, "/Contents/Frameworks/");
+    if (!nested) return false;
+    nested_name = nested + strlen("/Contents/Frameworks/");
+    if (nested_name[0] == '\0') return false;
+
+    for (p = buff; p < helpers; ) {
+        const char *hit = strstr(p, ".framework");
+        if (!hit || hit >= helpers) break;
+        if (hit[10] == '/' || hit[10] == '\0') {
+            outer_dot = hit;
+        }
+        p = hit + 10;
+    }
+    if (!outer_dot) return false;
+    outer_fw_end = outer_dot + 10; /* ".framework" */
+    outer_base = outer_fw_end;
+    while (outer_base > buff && outer_base[-1] != '/') {
+        outer_base--;
+    }
+    name_len = (size_t)(outer_fw_end - outer_base);
+    if (name_len == 0 || strncmp(nested_name, outer_base, name_len) != 0) return false;
+    nested_after = nested_name + name_len;
+    if (nested_after[0] != '\0' && nested_after[0] != '/') return false;
+
+    n = snprintf(rewritten, sizeof(rewritten), "%.*s%s",
+                 (int)(outer_fw_end - buff), buff, nested_after);
+    if (n <= 0 || (size_t)n >= sizeof(rewritten) || (size_t)n >= buffsz) return false;
+    if (stat(rewritten, &st) != 0 || ((st.st_mode & S_IFMT) != S_IFDIR)) return false;
+
+    fprintf(stderr, "cfbundle_helper_fw_resolve_v1 %s -> %s\n", buff, rewritten);
+    fflush(stderr);
+    memcpy(buff, rewritten, (size_t)n + 1);
+    return true;
+}
+
 static CFBundleRef _CFBundleCreate(CFAllocatorRef allocator, CFURLRef bundleURL, Boolean alreadyLocked, Boolean doFinalProcessing, Boolean noCaches) {
     CFBundleRef bundle = NULL;
     char buff[CFMaxPathSize];
@@ -1101,6 +1191,7 @@ static CFBundleRef _CFBundleCreate(CFAllocatorRef allocator, CFURLRef bundleURL,
     }
 
     (void)_CFBundlePromoteExecutablePathToBundleDir(buff, sizeof(buff));
+    (void)_CFBundleResolveNestedHelperFramework(buff, sizeof(buff));
 
     newURL = CFURLCreateFromFileSystemRepresentation(allocator, (uint8_t *)buff, strlen(buff), true);
     if (!newURL) newURL = (CFURLRef)CFRetain(bundleURL);
