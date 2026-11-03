@@ -140,7 +140,15 @@ id ___forwarding___(struct objc_sendv_margs *args, void *returnStorage)
         // ...
         // yes, I mean YOU!
         [target doesNotRecognizeSelector:_cmd];
-        return target;
+        /*
+         * A non-nil return is a new forwarding target. Returning self here
+         * restarts the same send, and a class that does not implement
+         * methodSignatureForSelector: loops forever inside NSWindow init,
+         * before Chromium starts CVDisplayLink or a renderer.
+         */
+        if (returnStorage != NULL)
+            *(void **)returnStorage = NULL;
+        return nil;
     }
 
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:signature];
