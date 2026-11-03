@@ -33,6 +33,10 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #import <objc/runtime.h>
 #import <stdio.h>
 
+extern id _objc_rootRetain(id obj);
+extern void _objc_rootRelease(id obj);
+extern id _objc_rootAutorelease(id obj);
+
 #import "NSBlockInvocationInternal.h"
 
 #define ALIGN_TO(value, alignment) \
@@ -81,6 +85,19 @@ id ___forwarding___(struct objc_sendv_margs *args, void *returnStorage)
      * messages that ___forwarding___ itself sends, and +class / -class, without
      * another objc_msgSend.
      */
+    if (_cmd == @selector(retain) || _cmd == @selector(autorelease)) {
+        if (_cmd == @selector(retain))
+            _objc_rootRetain(self);
+        else
+            _objc_rootAutorelease(self);
+        if (returnStorage != NULL)
+            *(id *)returnStorage = self;
+        return nil;
+    }
+    if (_cmd == @selector(release)) {
+        _objc_rootRelease(self);
+        return nil;
+    }
     if (_cmd == @selector(methodSignatureForSelector:) ||
         _cmd == @selector(forwardingTargetForSelector:) ||
         _cmd == @selector(doesNotRecognizeSelector:))
