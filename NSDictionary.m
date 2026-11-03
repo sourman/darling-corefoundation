@@ -491,12 +491,16 @@ SINGLETON_RR()
 
 + (id)dictionaryWithContentsOfFile:(NSString *)path
 {
-    if (path == nil)
-    {
-        return nil;
-    }
-    
-    return [[[self alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path]] autorelease];
+    id dict = nil;
+
+    if (path != nil)
+        dict = [[[self alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path]] autorelease];
+    /* Chromium's dock tile treats a missing plist as a hard error and then
+     * messages the result. An empty dictionary keeps that lookup off the
+     * forwarder. */
+    if (dict == nil)
+        dict = [[[self alloc] init] autorelease];
+    return dict;
 }
 
 + (id)dictionaryWithContentsOfURL:(NSURL *)url

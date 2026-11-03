@@ -75,6 +75,28 @@ id ___forwarding___(struct objc_sendv_margs *args, void *returnStorage)
 
     long long result = 0LL;
 
+    /*
+     * A class with no NSObject methods (the dock path messages +class on one)
+     * forwards methodSignatureForSelector: into this function again. Answer the
+     * messages that ___forwarding___ itself sends, and +class / -class, without
+     * another objc_msgSend.
+     */
+    if (_cmd == @selector(methodSignatureForSelector:) ||
+        _cmd == @selector(forwardingTargetForSelector:) ||
+        _cmd == @selector(doesNotRecognizeSelector:))
+    {
+        if (returnStorage != NULL)
+            *(void **)returnStorage = NULL;
+        return nil;
+    }
+    if (_cmd == @selector(class))
+    {
+        Class resultClass = class_isMetaClass(class) ? (Class)self : class;
+        if (returnStorage != NULL)
+            *(Class *)returnStorage = resultClass;
+        return nil;
+    }
+
     id target = nil;
 
     if (class_respondsToSelector(class, @selector(forwardingTargetForSelector:))) {
