@@ -6,6 +6,8 @@
 //
 
 #import <Foundation/NSDictionary.h>
+#import <Foundation/NSNull.h>
+#include <unistd.h>
 
 #import <CoreFoundation/CFData.h>
 #import <CoreFoundation/CFPropertyList.h>
@@ -1257,8 +1259,11 @@ static NSString *_getDescription(id obj, id locale, int level)
     {
         if ((obj == nil) || (key == nil))
         {
-            @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Cannot set nil objects nor nil keys" userInfo:nil];
-            return;
+            dprintf(2, "__NSCFDictionary setObject nil obj=%p key=%p ret=%p\n",
+                    obj, key, __builtin_return_address(0));
+            if (key == nil)
+                return;
+            obj = [NSNull null];
         }
 
         [self willChangeValueForKey:key];
