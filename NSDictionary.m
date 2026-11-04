@@ -6,6 +6,8 @@
 //
 
 #import <Foundation/NSDictionary.h>
+#import <Foundation/NSNull.h>
+#include <unistd.h>
 
 #import <CoreFoundation/CFData.h>
 #import <CoreFoundation/CFPropertyList.h>
@@ -491,12 +493,16 @@ SINGLETON_RR()
 
 + (id)dictionaryWithContentsOfFile:(NSString *)path
 {
-    if (path == nil)
-    {
-        return nil;
-    }
-    
-    return [[[self alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path]] autorelease];
+    id dict = nil;
+
+    if (path != nil)
+        dict = [[[self alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path]] autorelease];
+    /* Chromium's dock tile treats a missing plist as a hard error and then
+     * messages the result. An empty dictionary keeps that lookup off the
+     * forwarder. */
+    if (dict == nil)
+        dict = [[[self alloc] init] autorelease];
+    return dict;
 }
 
 + (id)dictionaryWithContentsOfURL:(NSURL *)url
@@ -1253,8 +1259,11 @@ static NSString *_getDescription(id obj, id locale, int level)
     {
         if ((obj == nil) || (key == nil))
         {
-            @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Cannot set nil objects nor nil keys" userInfo:nil];
-            return;
+            dprintf(2, "__NSCFDictionary setObject nil obj=%p key=%p ret=%p\n",
+                    obj, key, __builtin_return_address(0));
+            if (key == nil)
+                return;
+            obj = [NSNull null];
         }
 
         [self willChangeValueForKey:key];

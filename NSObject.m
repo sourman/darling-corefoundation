@@ -85,11 +85,12 @@ static void NSUnrecognizedForwarding() { __asm__("int3"); }
     }
     else
     {
-        // DONT EVEN THINK ABOUT REMOVING/HACKING AROUND THIS!
-        // EVER!
-        // ...
-        // yes, I mean YOU!
-        [NSException raise:NSInvalidArgumentException format:@"+[%s %s]: unrecognized selector sent to instance %p", class_getName(self), sel_getName(sel), self];
+        /*
+         * Raising here is uncaught in Chromium and kills the process while it
+         * is still creating the window, before CVDisplayLinkStart. Log and
+         * return so a missing selector does not abort the browser.
+         */
+        fprintf(stderr, "+[%s %s]: unrecognized selector sent to instance %p\n", class_getName(self), sel_getName(sel), self);
     }
 }
 
@@ -102,11 +103,7 @@ static void NSUnrecognizedForwarding() { __asm__("int3"); }
     }
     else
     {
-        // DONT EVEN THINK ABOUT REMOVING/HACKING AROUND THIS!
-        // EVER!
-        // ...
-        // yes, I mean YOU!
-        [NSException raise:NSInvalidArgumentException format:@"-[%s %s]: unrecognized selector sent to instance %p", object_getClassName(self), sel_getName(sel), self];
+        fprintf(stderr, "-[%s %s]: unrecognized selector sent to instance %p\n", object_getClassName(self), sel_getName(sel), self);
     }
 }
 
