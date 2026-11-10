@@ -631,6 +631,7 @@ typedef struct _per_run_data {
     uint32_t b;
     uint32_t stopped;
     uint32_t ignoreWakeUps;
+    uint32_t deferredWake;
 } _per_run_data;
 
 struct __CFRunLoop {
@@ -663,6 +664,7 @@ CF_INLINE volatile _per_run_data *__CFRunLoopPushPerRunData(CFRunLoopRef rl) {
     rl->_perRunData->b = 0x4346524C; // 'CFRL'
     rl->_perRunData->stopped = 0x00000000;
     rl->_perRunData->ignoreWakeUps = 0x00000000;
+    rl->_perRunData->deferredWake = 0;
     return previous;
 }
 
@@ -814,6 +816,9 @@ static CFRunLoopModeRef __CFRunLoopFindMode(CFRunLoopRef rl, CFStringRef modeNam
     
     ret = __CFPortSetInsert(rl->_wakeUpPort, rlm->_portSet);
     if (KERN_SUCCESS != ret) CRASH("*** Unable to insert wake up port into port set. (%d) ***", ret);
+    fprintf(stderr, "CFRunLoop mode wake port=0x%x set=0x%x\n",
+        rl->_wakeUpPort, rlm->_portSet);
+    fflush(stderr);
     
 #if DEPLOYMENT_TARGET_WINDOWS
     rlm->_msgQMask = 0;
@@ -1625,6 +1630,8 @@ static void __CFRUNLOOP_IS_CALLING_OUT_TO_A_BLOCK__(void (^block)(void)) {
     asm __volatile__(""); // thwart tail-call optimization
 }
 
+static void slot_note_perform(const char *kind, void *perform, void *info);
+
 static Boolean __CFRunLoopDoBlocks(CFRunLoopRef rl, CFRunLoopModeRef rlm) { // Call with rl and rlm locked
     if (!rl->_blocks_head) return false;
     if (!rlm || !rlm->_name) return false;
@@ -1657,6 +1664,7 @@ static Boolean __CFRunLoopDoBlocks(CFRunLoopRef rl, CFRunLoopModeRef rlm) { // C
             CFRelease(curr->_mode);
             free(curr);
 	    if (doit) {
+                slot_note_perform("block", (void *)block, NULL);
                 __CFRUNLOOP_IS_CALLING_OUT_TO_A_BLOCK__(block);
 	        did = true;
 	    }
@@ -1742,6 +1750,96 @@ static void __CFRunLoopCollectSources0(const void *value, void *context) {
     }
 }
 
+static uintptr_t slot_fw_lo, slot_fw_hi;
+static int slot_fw_ready;
+
+static void slot_fw_init(void) {
+    FILE *fp;
+    char line[512];
+    if (slot_fw_ready) return;
+    slot_fw_ready = 1;
+    fp = fopen("/proc/self/maps", "r");
+    if (!fp) return;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long lo, hi;
+        if (!strstr(line, "r-xp") || !strstr(line, "Comet Framework.framework/Versions")) continue;
+        if (strstr(line, "Helpers")) continue;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2) {
+            slot_fw_lo = (uintptr_t)lo;
+            slot_fw_hi = (uintptr_t)hi;
+            break;
+        }
+    }
+    fclose(fp);
+}
+
+static uintptr_t slot_file_off(void *fn) {
+    uintptr_t a = (uintptr_t)fn;
+    slot_fw_init();
+    if (a < slot_fw_lo || a >= slot_fw_hi) return 0;
+    return a - slot_fw_lo;
+}
+
+static int slot_is_viz(void) {
+    char name[64];
+    name[0] = 0;
+    pthread_getname_np(pthread_self(), name, sizeof(name));
+    return strstr(name, "Viz") != NULL;
+}
+
+static __thread int slot_phase;
+static __thread int slot_entered;
+static __thread int slot_performed;
+static __thread uintptr_t slot_last_file;
+static __thread void *slot_last_info;
+static int slot_log_n;
+
+static void slot_log(const char *line) {
+    if (slot_log_n >= 80 || line == NULL) return;
+    slot_log_n++;
+    fprintf(stderr, "%s", line);
+    fflush(stderr);
+}
+
+static void slot_note_perform(const char *kind, void *perform, void *info) {
+    uintptr_t file;
+    char line[200];
+    if (!slot_phase || !slot_is_viz()) return;
+    file = slot_file_off(perform);
+    slot_performed++;
+    slot_last_file = file;
+    slot_last_info = info;
+    if (file == 0x32a6aa0) slot_entered = 1;
+    snprintf(line, sizeof(line),
+        "slot %s perform=%p file=0x%lx info=%p entered=%d\n",
+        kind, perform, (unsigned long)file, info, file == 0x32a6aa0);
+    slot_log(line);
+}
+
+static void slot_note_return(mach_port_t live, mach_port_t wakeup, int msgid) {
+    char line[180];
+    if (!slot_is_viz()) return;
+    slot_phase = 1;
+    slot_entered = 0;
+    slot_performed = 0;
+    slot_last_file = 0;
+    slot_last_info = NULL;
+    snprintf(line, sizeof(line),
+        "slot return live=0x%x wakeup_port=%d id=%d\n",
+        (unsigned)live, live == wakeup, msgid);
+    slot_log(line);
+}
+
+static void slot_note_reblock(void) {
+    char line[200];
+    if (!slot_phase || !slot_is_viz()) return;
+    snprintf(line, sizeof(line),
+        "slot reblock entered=%d performed=%d last_file=0x%lx info=%p\n",
+        slot_entered, slot_performed, (unsigned long)slot_last_file, slot_last_info);
+    slot_log(line);
+    slot_phase = 0;
+}
+
 static void __CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE0_PERFORM_FUNCTION__() __attribute__((noinline));
 static void __CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE0_PERFORM_FUNCTION__(void (*perform)(void *), void *info) {
     if (perform) {
@@ -1791,6 +1889,7 @@ static Boolean __CFRunLoopDoSources0(CFRunLoopRef rl, CFRunLoopModeRef rlm, Bool
 	        __CFRunLoopSourceUnsetSignaled(rls);
 	        if (__CFIsValid(rls)) {
 	            __CFRunLoopSourceUnlock(rls);
+                    slot_note_perform("source0", (void *)rls->_context.version0.perform, rls->_context.version0.info);
                     __CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE0_PERFORM_FUNCTION__(rls->_context.version0.perform, rls->_context.version0.info);
 	            CHECK_FOR_FORK();
 	            sourceHandled = true;
@@ -1810,6 +1909,7 @@ static Boolean __CFRunLoopDoSources0(CFRunLoopRef rl, CFRunLoopModeRef rlm, Bool
 		    __CFRunLoopSourceUnsetSignaled(rls);
 		    if (__CFIsValid(rls)) {
 		        __CFRunLoopSourceUnlock(rls);
+                        slot_note_perform("source0", (void *)rls->_context.version0.perform, rls->_context.version0.info);
                         __CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE0_PERFORM_FUNCTION__(rls->_context.version0.perform, rls->_context.version0.info);
 		        CHECK_FOR_FORK();
 		        sourceHandled = true;
@@ -1853,6 +1953,7 @@ static Boolean __CFRunLoopDoSource1(CFRunLoopRef rl, CFRunLoopModeRef rlm, CFRun
 	__CFRunLoopSourceUnsetSignaled(rls);
 	__CFRunLoopSourceUnlock(rls);
         __CFRunLoopDebugInfoForRunLoopSource(rls);
+        slot_note_perform("source1", (void *)rls->_context.version1.perform, rls->_context.version1.info);
         __CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE1_PERFORM_FUNCTION__(rls->_context.version1.perform,
 #if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI
             msg, size, reply,
@@ -2219,6 +2320,7 @@ static Boolean __CFRunLoopServiceMachPort(mach_port_name_t port, mach_msg_header
         msg->msgh_size = buffer_size;
         msg->msgh_id = 0;
         if (TIMEOUT_INFINITY == timeout) { CFRUNLOOP_SLEEP(); } else { CFRUNLOOP_POLL(); }
+        if (TIMEOUT_INFINITY == timeout) slot_note_reblock();
         ret = mach_msg(msg, MACH_RCV_MSG|(voucherState ? MACH_RCV_VOUCHER : 0)|MACH_RCV_LARGE|((TIMEOUT_INFINITY != timeout) ? MACH_RCV_TIMEOUT : 0)|MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0)|MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AV), 0, msg->msgh_size, port, timeout, MACH_PORT_NULL);
 
         // Take care of all voucher-related work right after mach_msg.
@@ -2416,6 +2518,10 @@ static int32_t __CFRunLoopRun(CFRunLoopRef rl, CFRunLoopModeRef rlm, CFTimeInter
 	}
 
         Boolean poll = sourceHandledThisLoop || (0ULL == timeout_context->termTSR);
+        if (rl->_perRunData->deferredWake) {
+            rl->_perRunData->deferredWake = 0;
+            poll = true;
+        }
 
         if (MACH_PORT_NULL != dispatchPort && !didDispatchPortLastTime) {
 #if DEPLOYMENT_TARGET_MACOSX || DEPLOYMENT_TARGET_EMBEDDED || DEPLOYMENT_TARGET_EMBEDDED_MINI
@@ -2548,6 +2654,9 @@ static int32_t __CFRunLoopRun(CFRunLoopRef rl, CFRunLoopModeRef rlm, CFTimeInter
         
         
 #endif
+        if (MACH_PORT_NULL != livePort) {
+            slot_note_return(livePort, rl->_wakeUpPort, msg ? msg->msgh_id : 0);
+        }
         if (MACH_PORT_NULL == livePort) {
             CFRUNLOOP_WAKEUP_FOR_NOTHING();
             // handle nothing
@@ -2719,7 +2828,23 @@ void CFRunLoopWakeUp(CFRunLoopRef rl) {
     CHECK_FOR_FORK();
     // This lock is crucial to ignorable wakeups, do not remove it.
     __CFRunLoopLock(rl);
+    /*
+     * ignoreWakeUps is set during callouts. The display-link source posts
+     * OnBeginFrame with a wakeup on this port. Sending here fills the
+     * one-deep queue and the real IPC wake is then MACH_SEND_TIMED_OUT.
+     * Remember the request and rescan sources before the next sleep.
+     */
     if (__CFRunLoopIsIgnoringWakeUps(rl)) {
+        static int ignored_logs;
+        rl->_perRunData->deferredWake = 1;
+        if (ignored_logs < 4) {
+            uint64_t tid = 0;
+            ignored_logs++;
+            pthread_threadid_np(NULL, &tid);
+            fprintf(stderr, "CFRunLoopWakeUp deferred port=0x%x tid=%llu\n",
+                rl->_wakeUpPort, (unsigned long long)tid);
+            fflush(stderr);
+        }
         __CFRunLoopUnlock(rl);
         return;
     }
@@ -2729,6 +2854,17 @@ void CFRunLoopWakeUp(CFRunLoopRef rl) {
      * to lose a wakeup, but the send may fail if there is already a
      * wakeup pending, since the queue length is 1. */
     ret = __CFSendTrivialMachMessage(rl->_wakeUpPort, 0, MACH_SEND_TIMEOUT, 0);
+    {
+        uint64_t tid = 0;
+        static int wake_logs;
+        pthread_threadid_np(NULL, &tid);
+        if (wake_logs < 40) {
+            wake_logs++;
+            fprintf(stderr, "CFRunLoopWakeUp port=0x%x ret=%d tid=%llu\n",
+                rl->_wakeUpPort, ret, (unsigned long long)tid);
+            fflush(stderr);
+        }
+    }
     if (ret != MACH_MSG_SUCCESS && ret != MACH_SEND_TIMED_OUT) CRASH("*** Unable to send message to wake up port. (%d) ***", ret);
 #elif DEPLOYMENT_TARGET_WINDOWS
     SetEvent(rl->_wakeUpPort);
