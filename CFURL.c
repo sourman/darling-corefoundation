@@ -5036,3 +5036,17 @@ Boolean CFURLGetFSRef(CFURLRef urlref, FSRefPtr fsref)
     return rv;
 }
 
+const CFStringRef NSURLContentTypeKey = CFSTR("NSURLContentTypeKey");
+
+CFIndex CFStringGetHyphenationLocationBeforeIndex(CFStringRef string, CFIndex location, CFRange limitRange, CFOptionFlags options, CFLocaleRef locale, UTF32Char *character)
+{
+	(void)string; (void)location; (void)limitRange; (void)options; (void)locale; (void)character;
+	return kCFNotFound;
+}
+
+Boolean CFStringIsHyphenationAvailableForLocale(CFLocaleRef locale)
+{
+	(void)locale;
+	return false;
+}
+

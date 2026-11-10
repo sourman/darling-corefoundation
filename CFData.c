@@ -487,6 +487,8 @@ CFIndex CFDataGetLength(CFDataRef data) {
 }
 
 const uint8_t *CFDataGetBytePtr(CFDataRef data) {
+    if (data == NULL)
+        return NULL;
     CF_OBJC_FUNCDISPATCHV(CFDataGetTypeID(), const uint8_t *, (NSData *)data, bytes);
     __CFGenericValidateType(data, CFDataGetTypeID());
     // compaction: if inline, always do the computation.
@@ -494,6 +496,8 @@ const uint8_t *CFDataGetBytePtr(CFDataRef data) {
 }
 
 uint8_t *CFDataGetMutableBytePtr(CFMutableDataRef data) {
+    if (data == NULL)
+        return NULL;
     CF_OBJC_FUNCDISPATCHV(CFDataGetTypeID(), uint8_t *, (NSMutableData *)data, mutableBytes);
     CFAssert1(__CFDataIsMutable(data), __kCFLogAssertion, "%s(): data is immutable", __PRETTY_FUNCTION__);
     // compaction: if inline, always do the computation.

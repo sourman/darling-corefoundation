@@ -33,6 +33,10 @@ along with Darling.  If not, see <http://www.gnu.org/licenses/>.
 #import <objc/runtime.h>
 #import <stdio.h>
 
+extern id _objc_rootRetain(id obj);
+extern void _objc_rootRelease(id obj);
+extern id _objc_rootAutorelease(id obj);
+
 #import "NSBlockInvocationInternal.h"
 
 #define ALIGN_TO(value, alignment) \
@@ -75,6 +79,41 @@ id ___forwarding___(struct objc_sendv_margs *args, void *returnStorage)
 
     long long result = 0LL;
 
+    /*
+     * A class with no NSObject methods (the dock path messages +class on one)
+     * forwards methodSignatureForSelector: into this function again. Answer the
+     * messages that ___forwarding___ itself sends, and +class / -class, without
+     * another objc_msgSend.
+     */
+    if (_cmd == @selector(retain) || _cmd == @selector(autorelease)) {
+        if (_cmd == @selector(retain))
+            _objc_rootRetain(self);
+        else
+            _objc_rootAutorelease(self);
+        if (returnStorage != NULL)
+            *(id *)returnStorage = self;
+        return nil;
+    }
+    if (_cmd == @selector(release)) {
+        _objc_rootRelease(self);
+        return nil;
+    }
+    if (_cmd == @selector(methodSignatureForSelector:) ||
+        _cmd == @selector(forwardingTargetForSelector:) ||
+        _cmd == @selector(doesNotRecognizeSelector:))
+    {
+        if (returnStorage != NULL)
+            *(void **)returnStorage = NULL;
+        return nil;
+    }
+    if (_cmd == @selector(class))
+    {
+        Class resultClass = class_isMetaClass(class) ? (Class)self : class;
+        if (returnStorage != NULL)
+            *(Class *)returnStorage = resultClass;
+        return nil;
+    }
+
     id target = nil;
 
     if (class_respondsToSelector(class, @selector(forwardingTargetForSelector:))) {
@@ -101,7 +140,15 @@ id ___forwarding___(struct objc_sendv_margs *args, void *returnStorage)
         // ...
         // yes, I mean YOU!
         [target doesNotRecognizeSelector:_cmd];
-        return target;
+        /*
+         * A non-nil return is a new forwarding target. Returning self here
+         * restarts the same send, and a class that does not implement
+         * methodSignatureForSelector: loops forever inside NSWindow init,
+         * before Chromium starts CVDisplayLink or a renderer.
+         */
+        if (returnStorage != NULL)
+            *(void **)returnStorage = NULL;
+        return nil;
     }
 
     NSInvocation *inv = [NSInvocation invocationWithMethodSignature:signature];

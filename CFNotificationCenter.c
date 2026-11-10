@@ -145,7 +145,8 @@ CF_EXPORT void CFNotificationCenterAddObserver(CFNotificationCenterRef center, c
     obs->retainCount = 0;
     obs->observer = observer;
     obs->callBack = callBack;
-    obs->name = CFStringCreateCopy(kCFAllocatorDefault, name);
+    /* NULL means every name. CFStringCreateCopy faults on a null string. */
+    obs->name = name ? CFStringCreateCopy(kCFAllocatorDefault, name) : NULL;
     obs->object = object;
     obs->suspensionBehavior = suspensionBehavior;
     OSSpinLockLock(&center->lock);
@@ -172,7 +173,7 @@ void removeObserver(CFNotificationObserver *observer, struct __CFNotificationRem
     if (observer->observer == ctx->observer) {
         Boolean nameMatches = false;
         Boolean objectMatches = false;
-        if (ctx->name != NULL && CFStringCompare(observer->name, ctx->name, 0) == kCFCompareEqualTo) {
+        if (ctx->name != NULL && observer->name != NULL && CFStringCompare(observer->name, ctx->name, 0) == kCFCompareEqualTo) {
             nameMatches = true;
         } else if (ctx->name == NULL) {
             nameMatches = true;
