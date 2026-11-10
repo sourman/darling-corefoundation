@@ -758,6 +758,8 @@ void _CFPreferencesDomainSetDictionary(CFPreferencesDomainRef domain, CFDictiona
 }
 
 CFDictionaryRef _CFPreferencesDomainDeepCopyDictionary(CFPreferencesDomainRef domain) {
+    if (!domain || !domain->_callBacks || !domain->_callBacks->copyDomainDictionary)
+        return NULL;
     CFDictionaryRef result = domain->_callBacks->copyDomainDictionary(domain->_context, domain->_domain);
     if(result && CFDictionaryGetCount(result) == 0) {
         CFRelease(result);
